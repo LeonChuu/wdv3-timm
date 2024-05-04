@@ -1,6 +1,9 @@
+import json
+import os
 from dataclasses import dataclass
+from io import TextIOWrapper
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
@@ -15,6 +18,8 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+AUTOTAGGER_TAG = "autotagger"
+default_color="Green"
 MODEL_REPO_MAP = {
     "vit": "SmilingWolf/wd-vit-tagger-v3",
     "swinv2": "SmilingWolf/wd-swinv2-tagger-v3",
@@ -108,20 +113,132 @@ def get_tags(
 
     return caption, taglist, rating_labels, char_labels, gen_labels
 
+def get_filepaths(dir: Path) -> List[dict]:
+    result = []
+    for dirpath, dirnames, filenames in os.walk(dir):
+        for filename in filenames:
+            if(filename.endswith(('.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.gif'))):
+                result.append({'fullpath': Path(os.path.join(dirpath, filename)), 'dirpath': dirpath, 'filename': filename})
+    return result
 
 @dataclass
 class ScriptOptions:
-    image_file: Path = field(positional=True)
+    image_file_or_dir: Path = field(positional=True)
     model: str = field(default="vit")
+    output_json_file: Path = field(default="./output.json")
     gen_threshold: float = field(default=0.35)
     char_threshold: float = field(default=0.75)
 
+def add_autotagger_tag(tag_list: list):
+    autotagger_dict = {
+      "id": tag_list[len(tag_list) -1]['id'] + 1,
+      "name": AUTOTAGGER_TAG,
+      "aliases": [
+        "Autotagged",
+        "Autotagger",
+        "Autotag"
+      ],
+      "color": "Black"
+    }
+    tag_list.append(autotagger_dict)
+    return autotagger_dict
+
+def read_json_data(filepath: Path) -> tuple[TextIOWrapper,dict]:
+    if(not filepath.exists()):
+        json_file = open(filepath,"w+")
+        json_data = {
+            "ts-version": "9.1.0",
+            "tags": [
+                {
+                "id": 0,
+                "name": "Archived",
+                "aliases": [
+                    "Archive"
+                ],
+                "color": "Red"
+                },
+                {
+                "id": 1,
+                "name": "Favorite",
+                "aliases": [
+                    "Favorited",
+                    "Favorites"
+                ],
+                "color": "Yellow"
+                },
+            ],
+            "collations": [],
+            "fields": [],
+            "macros": [],
+            "entries": []
+        }
+    else:
+        json_file = open(filepath,"r+")
+        json_data=json.load(json_file)
+        backup_filepath=str(filepath) + '_backup.json'
+        with open(backup_filepath,'w+') as f:
+            json.dump(json_data,f)
+        print('backup saved to ' + backup_filepath)
+
+
+    return (json_file, json_data)
+
+def get_autotagged_tag(tag_list: list[dict], tag: str, autotagged_id: int):
+    tagged_list = [x for x in tag_list if (x["name"] == tag) and autotagged_id in x.get("subtag_ids",[])]
+    if(len(tagged_list) == 0):
+        new_tag = {
+            "id": tag_list[len(tag_list) - 1]["id"] + 1,
+            "name": tag,
+            "aliases": [
+                tag
+            ],
+            "color": default_color,
+            "subtag_ids":[autotagged_id]
+        }
+        tag_list.append(new_tag)
+        return new_tag
+    else:
+        return tagged_list[len(tagged_list) -1]
+
+def update_image_tag(tag_list: list, autotagging_tags: list, key: str, value: float, autotagger_tag: dict):
+    output_list = []
+    tag = autotagging_tags.get(key)
+    if( tag is None):
+        tag = get_autotagged_tag(tag_list, key, autotagger_tag['id'])
+        autotagging_tags[key] = tag
+    output_list.append(tag['id'])
+    print(f"  {key}: {value:.3f}")
+    return output_list
 
 def main(opts: ScriptOptions):
+
     repo_id = MODEL_REPO_MAP.get(opts.model)
-    image_path = Path(opts.image_file).resolve()
-    if not image_path.is_file():
-        raise FileNotFoundError(f"Image file not found: {image_path}")
+    if not opts.image_file_or_dir.exists():
+        raise FileNotFoundError(f"Image file not found: {opts.image_file_or_dir}")
+    if(opts.image_file_or_dir.is_dir()):
+        images = get_filepaths(opts.image_file_or_dir.resolve())
+        tagstudio_dir = opts.image_file_or_dir / '.TagStudio'
+        if(not (tagstudio_dir).exists()):
+            os.mkdir(tagstudio_dir)
+        output_file = tagstudio_dir / 'ts_library.json'
+
+    else:
+        output_file = opts.output_json_file
+        abspath=os.path.abspath(opts.image_file_or_dir)
+        images = [{'fullpath': Path(abspath).resolve(),
+                    'dirpath': os.path.dirname(abspath),
+                    'filename': os.path.basename(abspath)}]
+
+    json_file, json_data = read_json_data(output_file)
+    tag_list = sorted(json_data['tags'], key=lambda x: x['id'])
+
+    autotagger_list = [x for x in tag_list if x["name"] == AUTOTAGGER_TAG]
+    if(len(autotagger_list) == 0):
+        autotagger_tag = add_autotagger_tag(tag_list)
+        autotagged_before = False
+    else:
+        autotagger_tag = autotagger_list[len(autotagger_list) - 1]
+        autotagged_before = True
 
     print(f"Loading model '{opts.model}' from '{repo_id}'...")
     model: nn.Module = timm.create_model("hf-hub:" + repo_id, pretrained=True)
@@ -134,63 +251,105 @@ def main(opts: ScriptOptions):
     print("Creating data transform...")
     transform = create_transform(**resolve_data_config(model.pretrained_cfg, model=model))
 
-    print("Loading image and preprocessing...")
-    # get image
-    img_input: Image.Image = Image.open(image_path)
-    # ensure image is RGB
-    img_input = pil_ensure_rgb(img_input)
-    # pad to square with white background
-    img_input = pil_pad_square(img_input)
-    # run the model's input transform to convert to tensor and rescale
-    inputs: Tensor = transform(img_input).unsqueeze(0)
-    # NCHW image RGB to BGR
-    inputs = inputs[:, [2, 1, 0]]
+    autotagging_tags={x['name']: x for x in tag_list if autotagger_tag['id'] in x.get("subtag_ids",[])}
 
-    print("Running inference...")
-    with torch.inference_mode():
-        # move model to GPU, if available
-        if torch_device.type != "cpu":
-            model = model.to(torch_device)
-            inputs = inputs.to(torch_device)
-        # run the model
-        outputs = model.forward(inputs)
-        # apply the final activation function (timm doesn't support doing this internally)
-        outputs = F.sigmoid(outputs)
-        # move inputs, outputs, and model back to to cpu if we were on GPU
-        if torch_device.type != "cpu":
-            inputs = inputs.to("cpu")
-            outputs = outputs.to("cpu")
-            model = model.to("cpu")
+    #TODO not reprocess same file twice
+    img_id=0
+    print("Loading images and preprocessing...")
+    entries_dict = {x.get('path','.') + x['filename']  : x for x in json_data['entries']}
+    for image_path in images:
+        is_new_entry=False
+        print(image_path)
+        # get image
+        img_input: Image.Image = Image.open(image_path['fullpath'])
+        # ensure image is RGB
+        img_input = pil_ensure_rgb(img_input)
+        # pad to square with white background
+        img_input = pil_pad_square(img_input)
+        # run the model's input transform to convert to tensor and rescale
+        inputs: Tensor = transform(img_input).unsqueeze(0)
+        # NCHW image RGB to BGR
+        inputs = inputs[:, [2, 1, 0]]
 
-    print("Processing results...")
-    caption, taglist, ratings, character, general = get_tags(
-        probs=outputs.squeeze(0),
-        labels=labels,
-        gen_threshold=opts.gen_threshold,
-        char_threshold=opts.char_threshold,
-    )
+        print("Running inference...")
+        with torch.inference_mode():
+            # move model to GPU, if available
+            if torch_device.type != "cpu":
+                model = model.to(torch_device)
+                inputs = inputs.to(torch_device)
+            # run the model
+            outputs = model.forward(inputs)
+            # apply the final activation function (timm doesn't support doing this internally)
+            outputs = F.sigmoid(outputs)
+            # move inputs, outputs, and model back to to cpu if we were on GPU
+            if torch_device.type != "cpu":
+                inputs = inputs.to("cpu")
+                outputs = outputs.to("cpu")
+                model = model.to("cpu")
 
-    print("--------")
-    print(f"Caption: {caption}")
-    print("--------")
-    print(f"Tags: {taglist}")
+        print("Processing results...")
+        caption, taglist, ratings, character, general = get_tags(
+            probs=outputs.squeeze(0),
+            labels=labels,
+            gen_threshold=opts.gen_threshold,
+            char_threshold=opts.char_threshold,
+        )
+        relative_path = os.path.relpath(image_path['dirpath'], opts.image_file_or_dir)
+        image_dict = entries_dict.get(relative_path + image_path['filename'])
+        if(image_dict is None):
+            image_dict = {"id": img_id,"filename": image_path['filename']}
+            is_new_entry = True
+        if(relative_path != '.'):
+            image_dict['path'] = relative_path
+            #check and test this whole block
+        if(image_dict.get('fields') is not None):
+            current_image_tag_list= [x['7'] for x in image_dict['fields'] if isinstance(x,dict) and x.get('7') is not None]
+            if(len(current_image_tag_list) != 0):
+                current_image_tag_list = current_image_tag_list[0]
+            else:
+                image_dict['fields'].append({"7": current_image_tag_list})
+        else:
+            current_image_tag_list = []
+            image_dict['fields'] = [{"7": current_image_tag_list}]
+        print("--------")
+        print(f"Caption: {caption}")
+        print("--------")
+        print(f"Tags: {taglist}")
 
-    print("--------")
-    print("Ratings:")
-    for k, v in ratings.items():
-        print(f"  {k}: {v:.3f}")
+        print("--------")
+        print("Ratings:")
+        max_rating =('k',0)
+        for k, v in ratings.items():
+            if(v > max_rating[1]):
+                max_rating=(k,v)
+            print(f"  {k}: {v:.3f}")
+        current_image_tag_list.extend(update_image_tag(tag_list, autotagging_tags, max_rating[0],max_rating[1], autotagger_tag))
 
-    print("--------")
-    print(f"Character tags (threshold={opts.char_threshold}):")
-    for k, v in character.items():
-        print(f"  {k}: {v:.3f}")
+        print("--------")
+        print(f"Character tags (threshold={opts.char_threshold}):")
+        for k, v in character.items():
+            current_image_tag_list.extend(update_image_tag(tag_list, autotagging_tags, k, v, autotagger_tag))
 
-    print("--------")
-    print(f"General tags (threshold={opts.gen_threshold}):")
-    for k, v in general.items():
-        print(f"  {k}: {v:.3f}")
+        print("--------")
+        print(f"General tags (threshold={opts.gen_threshold}):")
+        for k, v in general.items():
+            current_image_tag_list.extend(update_image_tag(tag_list, autotagging_tags, k, v, autotagger_tag))
 
-    print("Done!")
+
+        image_tag_list_reference = current_image_tag_list
+        current_image_tag_list = sorted(set(current_image_tag_list))
+        image_tag_list_reference.clear()
+        image_tag_list_reference.extend(current_image_tag_list)
+        #is this right?
+        # image_dict["fields"] = [{"7": current_image_tag_list}]
+        if(is_new_entry):
+            json_data["entries"].append(image_dict)
+        img_id=img_id+1
+        print("Done!")
+    json_data["tags"] = tag_list
+    json_file.seek(0)
+    json_file.truncate()
+    json.dump(json_data, json_file)
 
 
 if __name__ == "__main__":
